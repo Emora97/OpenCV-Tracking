@@ -1,0 +1,510 @@
+"""
+
+Diagnostic ArUco tracker for Crazyflie drone marker.
+- SI units only: marker length is meters.
+- Hardcoded time windows near top.
+- Prints ANY detected marker IDs, not just the target ID.
+- Can scan the whole video first to find where the marker appears.
+- Saves debug frames so you can inspect what the detector sees.
+
+Controls:
+    q     quit
+    space pause/resume
+
+Manual FIG8_START selection controls:
+    d     next frame
+    a     previous frame
+    l     jump forward 30 frames
+    j     jump backward 30 frames
+    s     select current frame as FIG8_START
+    q     quit
+
+Output:
+    aruco_drone_track_si.csv
+    debug_frames/*.jpg
+"""
+
+from __future__ import annotations
+
+import csv
+from pathlib import Path
+from typing import Optional
+
+import cv2
+import numpy as np
+
+
+# =========================
+# USER SETTINGS
+# =========================
+
+VIDEO_PATH = "calib_marker_markerless.MOV"
+CALIBRATION_PATH = "iphone_calibration.npz"
+OUTPUT_CSV_PATH = "aruco_drone_track_si.csv"
+DEBUG_DIR = Path("debug_frames")
+
+# Marker setup: SI units only.
+ARUCO_DICTIONARY = cv2.aruco.DICT_4X4_50
+TARGET_MARKER_ID = 2
+# MARKER_LENGTH_M = 0.0254      # 1.00 in marker black-square side
+MARKER_LENGTH_M = 0.03175   # 1.25 in marker black-square side
+
+# IMPORTANT:
+# Set this to None for first diagnostic run. If detection happens, use the
+# printed timestamps to hardcode the final windows.
+#TIME_SPLITS_S: Optional[list[tuple[float, float]]] = None
+#TIME_SPLITS_S = [(71, 91)]
+#TIME_SPLITS_S = [(132, 154)]
+TIME_SPLITS_S = [(170, 179)]
+
+# =========================
+# FIGURE-8 SYNC / ORIGIN SETTINGS
+# =========================
+# Use the raw video timestamp where the figure-8 trajectory starts.
+# If you already know it, hardcode it. Otherwise leave None and the manual
+# frame selector will open before tracking.
+USE_FIG8_START_SYNC = True
+FIG8_START_VIDEO_TIME_S: Optional[float] = 170
+
+# If True, rows before the figure-8 starts are not written to the final CSV.
+# Raw video time is still preserved in any written rows.
+SAVE_ONLY_AFTER_FIG8_START = True
+
+# If True, the first detected target marker sample at/after FIG8_START becomes
+# the ArUco trajectory origin. The CSV will include x_rel_m/y_rel_m/z_rel_m.
+SET_ORIGIN_FROM_FIRST_FIG8_DETECTION = True
+
+# If SCAN_ONLY is True, it checks the video quickly and prints any IDs found.
+# It does not estimate pose or write the full tracking CSV.
+SCAN_ONLY = False
+SCAN_EVERY_N_FRAMES = 5
+
+SHOW_PREVIEW = True
+PREVIEW_MAX_WIDTH = 1280
+SAVE_DEBUG_FRAMES = False
+SAVE_EVERY_DETECTION_FRAME = False
+MAX_DEBUG_FRAMES = 80
+
+# If marker is small/blurry, upscaling can help detection.
+DETECTION_SCALE = 1.0         # try 1.5 or 2.0 if still no detections
+
+# Detector tuning. These are more permissive than OpenCV defaults.
+USE_SUBPIXEL_REFINEMENT = True
+MIN_MARKER_PERIMETER_RATE = 0.015
+MAX_MARKER_PERIMETER_RATE = 4.0
+ADAPTIVE_THRESH_WIN_SIZE_MIN = 3
+ADAPTIVE_THRESH_WIN_SIZE_MAX = 45
+ADAPTIVE_THRESH_WIN_SIZE_STEP = 4
+
+
+# =========================
+# CALIBRATION / DETECTION HELPERS
+# =========================
+
+def load_calibration_npz(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Calibration file not found: {path}")
+
+    data = np.load(path)
+    keys = set(data.files)
+
+    if {"camera_matrix", "dist_coeffs"}.issubset(keys):
+        camera_matrix = data["camera_matrix"]
+        dist_coeffs = data["dist_coeffs"]
+    elif {"camera_matrix", "dist_coeff"}.issubset(keys):
+        camera_matrix = data["camera_matrix"]
+        dist_coeffs = data["dist_coeff"]
+    elif {"mtx", "dist"}.issubset(keys):
+        camera_matrix = data["mtx"]
+        dist_coeffs = data["dist"]
+    else:
+        raise KeyError(f"Unsupported calibration keys: {sorted(keys)}")
+
+    return np.asarray(camera_matrix, dtype=np.float64), np.asarray(dist_coeffs, dtype=np.float64)
+
+
+def make_detector():
+    aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICTIONARY)
+
+    # OpenCV 4.7+ uses DetectorParameters(); older builds use DetectorParameters_create().
+    if hasattr(cv2.aruco, "DetectorParameters"):
+        params = cv2.aruco.DetectorParameters()
+    else:
+        params = cv2.aruco.DetectorParameters_create()
+
+    params.minMarkerPerimeterRate = MIN_MARKER_PERIMETER_RATE
+    params.maxMarkerPerimeterRate = MAX_MARKER_PERIMETER_RATE
+    params.adaptiveThreshWinSizeMin = ADAPTIVE_THRESH_WIN_SIZE_MIN
+    params.adaptiveThreshWinSizeMax = ADAPTIVE_THRESH_WIN_SIZE_MAX
+    params.adaptiveThreshWinSizeStep = ADAPTIVE_THRESH_WIN_SIZE_STEP
+
+    if USE_SUBPIXEL_REFINEMENT:
+        params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+
+    if hasattr(cv2.aruco, "ArucoDetector"):
+        return cv2.aruco.ArucoDetector(aruco_dict, params), None, None
+    return None, aruco_dict, params
+
+
+def detect(gray, detector, aruco_dict, params):
+    if detector is not None:
+        return detector.detectMarkers(gray)
+    return cv2.aruco.detectMarkers(gray, aruco_dict, parameters=params)
+
+
+def maybe_scale_gray(gray: np.ndarray) -> np.ndarray:
+    if DETECTION_SCALE == 1.0:
+        return gray
+    return cv2.resize(gray, None, fx=DETECTION_SCALE, fy=DETECTION_SCALE, interpolation=cv2.INTER_CUBIC)
+
+
+def rescale_corners(corners):
+    if DETECTION_SCALE == 1.0 or corners is None:
+        return corners
+    return [c / DETECTION_SCALE for c in corners]
+
+
+def iter_windows(fps: float, total_frames: int):
+    if TIME_SPLITS_S is None:
+        yield 1, 0, total_frames - 1, 0.0, total_frames / fps
+        return
+
+    for i, (start_s, end_s) in enumerate(TIME_SPLITS_S, start=1):
+        start_f = max(0, int(round(start_s * fps)))
+        end_f = min(total_frames - 1, int(round(end_s * fps)))
+        yield i, start_f, end_f, start_s, end_s
+
+
+def resize_for_preview(frame: np.ndarray) -> np.ndarray:
+    h, w = frame.shape[:2]
+    if w <= PREVIEW_MAX_WIDTH:
+        return frame
+    scale = PREVIEW_MAX_WIDTH / w
+    return cv2.resize(frame, (int(w * scale), int(h * scale)))
+
+
+def yaw_from_rvec_deg(rvec: np.ndarray) -> float:
+    R, _ = cv2.Rodrigues(rvec.reshape(3, 1))
+    return float(np.degrees(np.arctan2(R[1, 0], R[0, 0])))
+
+
+def draw_axis(frame, camera_matrix, dist_coeffs, rvec, tvec):
+    if hasattr(cv2, "drawFrameAxes"):
+        cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rvec, tvec, MARKER_LENGTH_M * 0.5)
+    elif hasattr(cv2.aruco, "drawAxis"):
+        cv2.aruco.drawAxis(frame, camera_matrix, dist_coeffs, rvec, tvec, MARKER_LENGTH_M * 0.5)
+
+
+def save_debug_frame(frame, frame_idx, timestamp_s, label):
+    DEBUG_DIR.mkdir(exist_ok=True)
+    safe_label = label.replace(" ", "_").replace(":", "-")
+    path = DEBUG_DIR / f"frame_{frame_idx:06d}_t_{timestamp_s:08.3f}_{safe_label}.jpg"
+    cv2.imwrite(str(path), frame)
+
+
+def manual_select_fig8_start_frame(cap: cv2.VideoCapture, fps: float, total_frames: int) -> float:
+    """
+    Lets the user scrub through the video and press 's' on the FIG8_START frame.
+    Returns the selected figure-8 start timestamp in raw video seconds.
+    """
+    print("\n=== Manual FIG8_START Selection ===")
+    print("Use the first video frame where the figure-8 trajectory begins.")
+    print("Controls:")
+    print("  d = next frame")
+    print("  a = previous frame")
+    print("  l = jump forward 30 frames")
+    print("  j = jump backward 30 frames")
+    print("  s = select current frame as FIG8_START")
+    print("  q = quit\n")
+
+    frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+    frame_idx = max(0, min(total_frames - 1, frame_idx))
+
+    while True:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            raise RuntimeError("Could not read frame during manual motion sync selection.")
+
+        video_time_s = frame_idx / fps
+        display = frame.copy()
+
+        cv2.putText(
+            display,
+            f"FIG8_START select | frame={frame_idx} | video_time={video_time_s:.3f}s",
+            (30, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            display,
+            "A/D frame | J/L jump | S select FIG8_START | Q quit",
+            (30, 80),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        cv2.imshow("Manual FIG8_START Selection", resize_for_preview(display))
+        key = cv2.waitKey(0) & 0xFF
+
+        if key == ord("d"):
+            frame_idx = min(total_frames - 1, frame_idx + 1)
+        elif key == ord("a"):
+            frame_idx = max(0, frame_idx - 1)
+        elif key == ord("l"):
+            frame_idx = min(total_frames - 1, frame_idx + 30)
+        elif key == ord("j"):
+            frame_idx = max(0, frame_idx - 30)
+        elif key == ord("s"):
+            cv2.destroyWindow("Manual FIG8_START Selection")
+            selected_time_s = frame_idx / fps
+            print(f"Selected FIG8_START frame: {frame_idx} at {selected_time_s:.3f} s")
+            return selected_time_s
+        elif key == ord("q"):
+            cv2.destroyWindow("Manual FIG8_START Selection")
+            raise RuntimeError("Manual FIG8_START selection cancelled.")
+
+
+def get_fig8_start_video_time(cap: cv2.VideoCapture, fps: float, total_frames: int) -> Optional[float]:
+    """
+    Returns the raw video timestamp where the figure-8 trajectory starts.
+    If sync is disabled, returns None and raw video time is used.
+    """
+    if not USE_FIG8_START_SYNC:
+        return None
+
+    fig8_start_time_s = FIG8_START_VIDEO_TIME_S
+    if fig8_start_time_s is None:
+        fig8_start_time_s = manual_select_fig8_start_frame(cap, fps, total_frames)
+
+    print("\n=== Sync Settings ===")
+    print(f"Figure-8 start video time: {fig8_start_time_s:.3f} s")
+    return fig8_start_time_s
+
+
+# =========================
+# MAIN
+# =========================
+
+def main():
+    camera_matrix, dist_coeffs = load_calibration_npz(CALIBRATION_PATH)
+    detector, aruco_dict, params = make_detector()
+
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {VIDEO_PATH}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    print("\n=== Video Info ===")
+    print(f"Video: {VIDEO_PATH}")
+    print(f"FPS: {fps:.3f}")
+    print(f"Resolution: {width} x {height}")
+    print(f"Total frames: {total_frames}")
+    print(f"Duration: {total_frames / fps:.3f} s")
+
+    fig8_start_video_time_s = get_fig8_start_video_time(cap, fps, total_frames)
+
+    print("\n=== Detection Settings ===")
+    print("Dictionary: DICT_4X4_50")
+    print(f"Target marker ID: {TARGET_MARKER_ID}")
+    print(f"Marker length: {MARKER_LENGTH_M:.6f} m")
+    print(f"Time splits: {TIME_SPLITS_S if TIME_SPLITS_S is not None else 'whole video'}")
+    print(f"Detection scale: {DETECTION_SCALE}")
+    print(f"Scan only: {SCAN_ONLY}")
+    print(f"Use FIG8_START sync: {USE_FIG8_START_SYNC}")
+    print(f"Save only after figure-8 start: {SAVE_ONLY_AFTER_FIG8_START}")
+
+    rows = []
+    frames_checked = 0
+    frames_with_any_id = 0
+    frames_with_target = 0
+    debug_frames_saved = 0
+    detected_id_counts: dict[int, int] = {}
+
+    origin_set = False
+    origin_x_m = np.nan
+    origin_y_m = np.nan
+    origin_z_m = np.nan
+
+    paused = False
+
+    for split_idx, start_f, end_f, start_s, end_s in iter_windows(fps, total_frames):
+        print(f"\nProcessing split {split_idx}: {start_s:.3f}s to {end_s:.3f}s, frames {start_f} to {end_f}")
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_f)
+        frame_idx = start_f
+
+        while frame_idx <= end_f:
+            if not paused:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                if SCAN_ONLY and ((frame_idx - start_f) % SCAN_EVERY_N_FRAMES != 0):
+                    frame_idx += 1
+                    continue
+
+                timestamp_s = frame_idx / fps
+                if fig8_start_video_time_s is not None:
+                    t_fig8_s = timestamp_s - fig8_start_video_time_s
+                else:
+                    t_fig8_s = timestamp_s
+
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray_for_detection = maybe_scale_gray(gray)
+                corners, ids, rejected = detect(gray_for_detection, detector, aruco_dict, params)
+                corners = rescale_corners(corners)
+
+                frames_checked += 1
+                ids_flat = [] if ids is None else [int(x) for x in ids.flatten()]
+
+                target_found = False
+                x_m = y_m = z_m = yaw_deg = np.nan
+                x_rel_m = y_rel_m = z_rel_m = np.nan
+
+                if ids_flat:
+                    frames_with_any_id += 1
+                    for marker_id in ids_flat:
+                        detected_id_counts[marker_id] = detected_id_counts.get(marker_id, 0) + 1
+
+                    print(f"frame {frame_idx:6d}, t={timestamp_s:8.3f}s: detected IDs {ids_flat}")
+                    cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+
+                    if TARGET_MARKER_ID in ids_flat:
+                        target_found = True
+                        frames_with_target += 1
+                        target_i = ids_flat.index(TARGET_MARKER_ID)
+                        target_corner = [corners[target_i]]
+
+                        rvec, tvec, _ = cv2.aruco.estimatePoseSingleMarkers(
+                            target_corner,
+                            MARKER_LENGTH_M,
+                            camera_matrix,
+                            dist_coeffs,
+                        )
+                        rvec_one = rvec[0, 0, :]
+                        tvec_one = tvec[0, 0, :]
+                        x_m, y_m, z_m = [float(v) for v in tvec_one]
+                        yaw_deg = yaw_from_rvec_deg(rvec_one)
+                        draw_axis(frame, camera_matrix, dist_coeffs, rvec_one.reshape(3, 1), tvec_one.reshape(3, 1))
+
+                        if (
+                            SET_ORIGIN_FROM_FIRST_FIG8_DETECTION
+                            and t_fig8_s >= 0.0
+                            and not origin_set
+                        ):
+                            origin_x_m = x_m
+                            origin_y_m = y_m
+                            origin_z_m = z_m
+                            origin_set = True
+                            print(
+                                f"ArUco origin set at frame {frame_idx}, "
+                                f"t_fig8={t_fig8_s:.3f}s: "
+                                f"x={origin_x_m:.4f}, "
+                                f"y={origin_y_m:.4f}, "
+                                f"z={origin_z_m:.4f}"
+                            )
+
+                        if origin_set:
+                            x_rel_m = x_m - origin_x_m
+                            y_rel_m = y_m - origin_y_m
+                            z_rel_m = z_m - origin_z_m
+
+                    if SAVE_DEBUG_FRAMES and debug_frames_saved < MAX_DEBUG_FRAMES:
+                        if SAVE_EVERY_DETECTION_FRAME or target_found:
+                            save_debug_frame(frame, frame_idx, timestamp_s, f"ids_{ids_flat}")
+                            debug_frames_saved += 1
+
+                cv2.putText(frame, f"video_t={timestamp_s:.3f}s fig8_t={t_fig8_s:.3f}s frame={frame_idx}", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+                cv2.putText(frame, f"IDs: {ids_flat if ids_flat else 'none'}", (30, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0) if ids_flat else (0,0,255), 2)
+
+                if not SCAN_ONLY:
+                    if (not SAVE_ONLY_AFTER_FIG8_START) or (t_fig8_s >= 0.0):
+                        rows.append({
+                            "split_index": split_idx,
+                            "frame_idx": frame_idx,
+                            "video_time_s": timestamp_s,
+                            "t_fig8_s": t_fig8_s,
+                            "fig8_start_video_time_s": fig8_start_video_time_s if fig8_start_video_time_s is not None else "",
+                            "marker_detected": int(target_found),
+                            "marker_id": TARGET_MARKER_ID if target_found else "",
+                            "x_camera_m": x_m,
+                            "y_camera_m": y_m,
+                            "z_camera_m": z_m,
+                            "x_rel_m": x_rel_m,
+                            "y_rel_m": y_rel_m,
+                            "z_rel_m": z_rel_m,
+                            "origin_x_camera_m": origin_x_m if origin_set else "",
+                            "origin_y_camera_m": origin_y_m if origin_set else "",
+                            "origin_z_camera_m": origin_z_m if origin_set else "",
+                            "yaw_camera_deg": yaw_deg,
+                            "all_detected_ids": ";".join(map(str, ids_flat)),
+                        })
+
+                if SHOW_PREVIEW:
+                    cv2.imshow("Aruco debug tracker", resize_for_preview(frame))
+
+                frame_idx += 1
+
+            key = cv2.waitKey(1) & 0xFF if SHOW_PREVIEW else 255
+            if key == ord("q"):
+                cap.release()
+                cv2.destroyAllWindows()
+                return
+            if key == ord(" "):
+                paused = not paused
+                print("Paused" if paused else "Resumed")
+
+    cap.release()
+    if SHOW_PREVIEW:
+        cv2.destroyAllWindows()
+
+    if not SCAN_ONLY:
+        with open(OUTPUT_CSV_PATH, "w", newline="") as f:
+            fieldnames = [
+                "split_index",
+                "frame_idx",
+                "video_time_s",
+                "t_fig8_s",
+                "fig8_start_video_time_s",
+                "marker_detected",
+                "marker_id",
+                "x_camera_m",
+                "y_camera_m",
+                "z_camera_m",
+                "x_rel_m",
+                "y_rel_m",
+                "z_rel_m",
+                "origin_x_camera_m",
+                "origin_y_camera_m",
+                "origin_z_camera_m",
+                "yaw_camera_deg",
+                "all_detected_ids",
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    print("\n=== Diagnostic Summary ===")
+    print(f"Frames checked: {frames_checked}")
+    print(f"Frames with any ArUco marker: {frames_with_any_id}")
+    print(f"Frames with target ID {TARGET_MARKER_ID}: {frames_with_target}")
+    print(f"Detected ID counts: {detected_id_counts if detected_id_counts else 'none'}")
+    if not SCAN_ONLY:
+        print(f"CSV saved to: {OUTPUT_CSV_PATH}")
+    if SAVE_DEBUG_FRAMES:
+        print(f"Debug frames saved in: {DEBUG_DIR.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
