@@ -1,0 +1,211 @@
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ============================================================
+# Reference / EKF / ArUco comparison for ONE experimental run
+# ============================================================
+LOG_CSV = r"figure8_reference_vs_state.csv"
+ARUCO_CSV = r"aruco_drone_track_si.csv"
+
+# ArUco CSV columns from current file:
+# time: t_fig8_s
+# position candidates: x_camera_m, y_camera_m, z_camera_m
+# For a camera-view trajectory, x_camera_m is usually image-horizontal,
+# and z_camera_m is usually depth. If your plot looks wrong, try
+# ARUCO_Y_COL = "y_camera_m" instead.
+ARUCO_TIME_COL = "t_fig8_s"
+ARUCO_X_COL = "x_camera_m"
+ARUCO_Y_COL = "y_camera_m"
+
+# Optional sync adjustment. Positive shifts ArUco later relative to log.
+ARUCO_TIME_OFFSET_S = 0
+
+# Match the display convention used in your poster/snip plots:
+# display horizontal <- world y, display vertical <- world x
+SWAP_LOG_XY_FOR_DISPLAY = True
+FLIP_LOG_DISPLAY_X = True
+FLIP_LOG_DISPLAY_Y = True
+
+# External tracker axis tuning. These only affect ArUco, not the onboard log.
+# Use these if the ArUco path is mirrored or rotated relative to the log plot.
+ARUCO_FLIP_X = False
+ARUCO_FLIP_Y = True
+CENTER_TRACKER_AT_START = True
+CENTER_LOG_AT_START = True
+
+# Optional fixed offsets after centering/flipping, in meters.
+ARUCO_X_OFFSET_M = 0
+ARUCO_Y_OFFSET_M = 0
+
+# Nearest-time matching tolerance for error metrics.
+MERGE_TOLERANCE_S = 0.08
+
+
+def load_csv(path):
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"CSV not found: {path}")
+    return pd.read_csv(path)
+
+
+def require_cols(df, cols, label):
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"{label} is missing required columns: {missing}\n"
+            f"Available columns: {list(df.columns)}"
+        )
+
+
+def map_log_display_axes(x, y):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if SWAP_LOG_XY_FOR_DISPLAY:
+        dx = y.copy()
+        dy = x.copy()
+    else:
+        dx = x.copy()
+        dy = y.copy()
+    if FLIP_LOG_DISPLAY_X:
+        dx = -dx
+    if FLIP_LOG_DISPLAY_Y:
+        dy = -dy
+    return dx, dy
+
+
+def prep_log(df):
+    required = [
+        "t_s", "x_ref_world_m", "y_ref_world_m", "x_est_m", "y_est_m"
+    ]
+    require_cols(df, required, "log")
+    out = pd.DataFrame()
+    out["t_s"] = df["t_s"].astype(float)
+    out["x_ref_m"], out["y_ref_m"] = map_log_display_axes(
+        df["x_ref_world_m"], df["y_ref_world_m"]
+    )
+    out["x_est_m"], out["y_est_m"] = map_log_display_axes(
+        df["x_est_m"], df["y_est_m"]
+    )
+    if CENTER_LOG_AT_START and len(out):
+        for xcol, ycol in [("x_ref_m", "y_ref_m"), ("x_est_m", "y_est_m")]:
+            out[xcol] = out[xcol] - out[xcol].iloc[0]
+            out[ycol] = out[ycol] - out[ycol].iloc[0]
+    return out.sort_values("t_s").dropna(subset=["t_s"])
+
+
+def prep_aruco(df):
+    if "marker_detected" in df.columns:
+        df = df[df["marker_detected"].astype(bool)].copy()
+
+    require_cols(df, [ARUCO_TIME_COL, ARUCO_X_COL, ARUCO_Y_COL], "aruco")
+    x = df[ARUCO_X_COL].astype(float).copy()
+    y = df[ARUCO_Y_COL].astype(float).copy()
+
+    if CENTER_TRACKER_AT_START and len(df):
+        x = x - x.iloc[0]
+        y = y - y.iloc[0]
+
+    if ARUCO_FLIP_X:
+        x = -x
+    if ARUCO_FLIP_Y:
+        y = -y
+
+    x = x + ARUCO_X_OFFSET_M
+    y = y + ARUCO_Y_OFFSET_M
+
+    out = pd.DataFrame({
+        "t_s": df[ARUCO_TIME_COL].astype(float) + float(ARUCO_TIME_OFFSET_S),
+        "x_aruco_m": x,
+        "y_aruco_m": y,
+    })
+    return out.sort_values("t_s").dropna(subset=["t_s"])
+
+
+def rmse(a):
+    return float(np.sqrt(np.nanmean(np.asarray(a, dtype=float) ** 2)))
+
+
+def add_error_columns(df, x_col, y_col, label):
+    df[f"x_err_ref_{label}_m"] = df[x_col] - df["x_ref_m"]
+    df[f"y_err_ref_{label}_m"] = df[y_col] - df["y_ref_m"]
+    df[f"pos_err_ref_{label}_m"] = np.hypot(
+        df[f"x_err_ref_{label}_m"], df[f"y_err_ref_{label}_m"]
+    )
+    df[f"x_err_est_{label}_m"] = df[x_col] - df["x_est_m"]
+    df[f"y_err_est_{label}_m"] = df[y_col] - df["y_est_m"]
+    df[f"pos_err_est_{label}_m"] = np.hypot(
+        df[f"x_err_est_{label}_m"], df[f"y_err_est_{label}_m"]
+    )
+    return df
+
+
+def print_ranges(log, aruco, merged):
+    print("\n=== Time ranges ===")
+    print(f"log:   {log['t_s'].min():.3f} to {log['t_s'].max():.3f} s, rows={len(log)}")
+    print(f"aruco: {aruco['t_s'].min():.3f} to {aruco['t_s'].max():.3f} s, rows={len(aruco)}")
+    print(f"merged rows within {MERGE_TOLERANCE_S:.3f} s tolerance: {len(merged)}")
+
+
+def print_summary(merged):
+    print("\n=== Error summary, same run only ===")
+    est_ref = np.hypot(merged["x_est_m"] - merged["x_ref_m"], merged["y_est_m"] - merged["y_ref_m"])
+    print(f"Reference vs EKF RMSE:    {rmse(est_ref):.4f} m")
+    print(f"Reference vs ArUco RMSE:  {rmse(merged['pos_err_ref_aruco_m']):.4f} m")
+    print(f"EKF vs ArUco RMSE:        {rmse(merged['pos_err_est_aruco_m']):.4f} m")
+    print(f"EKF vs ArUco mean error:  {merged['pos_err_est_aruco_m'].mean():.4f} m")
+    print(f"EKF vs ArUco max error:   {merged['pos_err_est_aruco_m'].max():.4f} m")
+
+
+def plot_trajectory(log, aruco):
+    plt.figure(figsize=(7, 7))
+    plt.plot(log["x_ref_m"], log["y_ref_m"], label="Reference")
+    plt.plot(log["x_est_m"], log["y_est_m"], label="EKF estimate")
+    plt.plot(aruco["x_aruco_m"], aruco["y_aruco_m"], label="ArUco tracking")
+    plt.xlabel("Display X [m]")
+    plt.ylabel("Display Y [m]")
+    plt.title("Reference vs EKF vs ArUco")
+    plt.axis("equal")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+
+
+def plot_errors(merged):
+    plt.figure(figsize=(10, 5))
+    est_ref = np.hypot(merged["x_est_m"] - merged["x_ref_m"], merged["y_est_m"] - merged["y_ref_m"])
+    plt.plot(merged["t_s"], est_ref, label="Reference vs EKF")
+    plt.plot(merged["t_s"], merged["pos_err_ref_aruco_m"], label="Reference vs ArUco")
+    plt.plot(merged["t_s"], merged["pos_err_est_aruco_m"], label="EKF vs ArUco")
+    plt.xlabel("Time [s]")
+    plt.ylabel("Position error [m]")
+    plt.title("ArUco Run Error Metrics")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+
+
+def main():
+    log = prep_log(load_csv(LOG_CSV))
+    aruco = prep_aruco(load_csv(ARUCO_CSV))
+
+    merged = pd.merge_asof(
+        log.sort_values("t_s"),
+        aruco.sort_values("t_s"),
+        on="t_s",
+        direction="nearest",
+        tolerance=MERGE_TOLERANCE_S,
+    ).dropna(subset=["x_aruco_m", "y_aruco_m"])
+    merged = add_error_columns(merged, "x_aruco_m", "y_aruco_m", "aruco")
+
+    print_ranges(log, aruco, merged)
+    print_summary(merged)
+
+    plot_trajectory(log, aruco)
+    plot_errors(merged)
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
