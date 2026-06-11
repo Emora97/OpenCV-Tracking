@@ -1,0 +1,505 @@
+"""
+
+Markerless OpenCV tracker for Crazyflie video with manual motion/figure-8 sync
+and optional pixel-to-meter conversion.
+
+Purpose:
+- Track a manually selected drone ROI using CSRT/KCF/MIL/GOTURN.
+- Manually select a sync frame, preferably the first frame of FIG8 motion.
+- Optionally click an origin point on the sync frame.
+- Optionally calibrate pixel-to-meter scale by clicking two points with a known
+  physical separation on the same image plane.
+- Save both pixel-space and approximate meter-space tracking data.
+
+Recommended use:
+1. Run script.
+2. In the sync selector, press S on the first frame of actual figure-8 motion.
+   If you are using a deliberate twitch before the figure-8, either:
+       - select the actual FIG8_START frame, with --delay 0, or
+       - select the twitch frame and use --delay <seconds_to_fig8_start>.
+3. Click the origin point on the sync frame.
+4. Click two board/grid points with a known distance between them.
+5. Select drone ROI.
+6. Track.
+
+Controls for manual sync selection:
+    d = next frame
+    a = previous frame
+    l = jump forward 30 frames
+    j = jump backward 30 frames
+    s = select current frame as sync event
+    q = quit
+
+Controls during tracking preview:
+    q / Esc = quit
+
+Output columns:
+    frame, video_time_s, t_fig8_s, detected,
+    x_px, y_px, x_rel_px, y_rel_px,
+    x_m, y_m, w_px, h_px, method,
+    sync_event_video_time_s, fig8_start_video_time_s,
+    origin_x_px, origin_y_px,
+    meters_per_pixel_x, meters_per_pixel_y, scale_distance_m
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+import time
+from pathlib import Path
+from typing import Optional, Tuple
+
+import cv2
+
+start_clock = time.time()
+
+
+# =========================
+# USER SETTINGS
+# =========================
+
+VIDEO_PATH = "calib_marker_markerless.mov"
+OUTPUT_CSV_PATH = "markerless_track_motion_sync_meters.csv"
+
+# Fallback/manual analysis window if command-line args are not used.
+START_TIME_S = 290
+END_TIME_S = 299
+
+# Motion / FIG8 sync settings.
+USE_SYNC_EVENT = True
+SYNC_EVENT_VIDEO_TIME_S: Optional[float] = 289.5  # Set manually if known, e.g. 284.431
+DELAY_AFTER_SYNC_EVENT_S = 0.0  # Use 0.0 if selecting actual FIG8_START frame.
+SAVE_ONLY_AFTER_FIG8_START = True
+
+# Origin and meter conversion.
+SELECT_ORIGIN_ON_SYNC_FRAME = True
+USE_METER_SCALE = True
+
+# If known, set these manually to skip scale clicking.
+METERS_PER_PIXEL_X: Optional[float] = None
+METERS_PER_PIXEL_Y: Optional[float] = None
+
+# If clicking scale points, enter known distance between those two points.
+# Example: 10 one-inch grid squares = 0.254 m.
+SCALE_DISTANCE_M = 1.22
+
+# If True, same scale is used for x and y. This is reasonable only if the board
+# plane is nearly parallel to the image plane. For perspective distortion,
+# homography is better, but this is useful for markerless-vs-ArUco validation.
+USE_ISOTROPIC_SCALE = True
+
+# Preview sizing.
+DISPLAY_WIDTH = 960
+
+
+# =========================
+# TRACKER HELPERS
+# =========================
+
+def create_tracker(name: str):
+    name = name.lower()
+
+    try:
+        if name == "csrt":
+            return cv2.TrackerCSRT_create()
+        if name == "kcf":
+            return cv2.TrackerKCF_create()
+        if name == "mil":
+            return cv2.TrackerMIL_create()
+        if name == "goturn":
+            return cv2.TrackerGOTURN_create()
+    except AttributeError:
+        pass
+
+    try:
+        if name == "csrt":
+            return cv2.legacy.TrackerCSRT_create()
+        if name == "kcf":
+            return cv2.legacy.TrackerKCF_create()
+        if name == "mil":
+            return cv2.legacy.TrackerMIL_create()
+    except AttributeError:
+        pass
+
+    raise ValueError(
+        f"Unsupported tracker or tracker not available: {name}\n"
+        "Try installing opencv-contrib-python."
+    )
+
+
+def resize_for_display(frame, display_width: int = DISPLAY_WIDTH):
+    h, w = frame.shape[:2]
+    if w <= display_width:
+        return frame.copy(), 1.0
+    scale = display_width / w
+    display_height = int(h * scale)
+    return cv2.resize(frame, (display_width, display_height), interpolation=cv2.INTER_AREA), scale
+
+
+def manual_select_sync_frame(cap: cv2.VideoCapture, fps: float, start_frame: int = 0) -> float:
+    print("\nManual motion/FIG8 sync selection")
+    print("Controls:")
+    print("  d = next frame")
+    print("  a = previous frame")
+    print("  l = jump forward 30 frames")
+    print("  j = jump backward 30 frames")
+    print("  s = select current frame as sync event / FIG8_START")
+    print("  q = quit\n")
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_idx = max(0, min(total_frames - 1, start_frame))
+
+    while True:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            raise RuntimeError("Could not read frame during manual sync selection.")
+
+        video_time_s = frame_idx / fps
+        display, _ = resize_for_display(frame)
+
+        cv2.putText(display, f"Frame: {frame_idx}  Time: {video_time_s:.3f} s", (30, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(display, "Press S on motion sync / FIG8_START frame", (30, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+
+        cv2.imshow("Manual Motion Sync Selection", display)
+        key = cv2.waitKey(0) & 0xFF
+
+        if key == ord("d"):
+            frame_idx = min(total_frames - 1, frame_idx + 1)
+        elif key == ord("a"):
+            frame_idx = max(0, frame_idx - 1)
+        elif key == ord("l"):
+            frame_idx = min(total_frames - 1, frame_idx + 30)
+        elif key == ord("j"):
+            frame_idx = max(0, frame_idx - 30)
+        elif key == ord("s"):
+            cv2.destroyWindow("Manual Motion Sync Selection")
+            print(f"Selected sync frame {frame_idx} at {video_time_s:.3f} s")
+            return video_time_s
+        elif key == ord("q"):
+            cv2.destroyWindow("Manual Motion Sync Selection")
+            raise RuntimeError("Manual sync selection cancelled.")
+
+
+def select_point(frame, title: str, prompt: str) -> Tuple[float, float]:
+    clicked: list[Tuple[int, int]] = []
+    display, scale = resize_for_display(frame)
+
+    def mouse_callback(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            clicked.clear()
+            clicked.append((x, y))
+
+    cv2.namedWindow(title)
+    cv2.setMouseCallback(title, mouse_callback)
+
+    while True:
+        temp = display.copy()
+        cv2.putText(temp, prompt, (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
+        cv2.putText(temp, "Click point, then press ENTER. Press Q to cancel.", (30, 75),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+
+        if clicked:
+            cv2.circle(temp, clicked[-1], 6, (0, 0, 255), -1)
+
+        cv2.imshow(title, temp)
+        key = cv2.waitKey(20) & 0xFF
+
+        if key in (13, 10) and clicked:  # Enter
+            cv2.destroyWindow(title)
+            x_disp, y_disp = clicked[-1]
+            return x_disp / scale, y_disp / scale
+        if key == ord("q"):
+            cv2.destroyWindow(title)
+            raise RuntimeError(f"{title} cancelled.")
+
+
+def select_scale_points(frame, known_distance_m: float, isotropic: bool = True):
+    p1 = select_point(frame, "Scale Point 1", "Click first scale reference point")
+    p2 = select_point(frame, "Scale Point 2", f"Click second point, distance = {known_distance_m:.4f} m")
+
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    pixel_distance = math.hypot(dx, dy)
+    if pixel_distance <= 0:
+        raise RuntimeError("Scale points must be different.")
+
+    meters_per_pixel = known_distance_m / pixel_distance
+
+    if isotropic:
+        return meters_per_pixel, meters_per_pixel
+
+    # Direction-specific fallback. If the clicked points are mostly horizontal,
+    # update x scale. If mostly vertical, update y scale. The other scale is set
+    # equal as a safe fallback unless separately specified.
+    if abs(dx) >= abs(dy):
+        mpp_x = known_distance_m / abs(dx) if abs(dx) > 0 else meters_per_pixel
+        mpp_y = meters_per_pixel
+    else:
+        mpp_x = meters_per_pixel
+        mpp_y = known_distance_m / abs(dy) if abs(dy) > 0 else meters_per_pixel
+    return mpp_x, mpp_y
+
+
+def select_initial_roi(cap: cv2.VideoCapture, frame_idx: int):
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    ret, frame = cap.read()
+    if not ret:
+        raise RuntimeError("Could not read the selected ROI start frame.")
+
+    small_frame, scale = resize_for_display(frame)
+    small_bbox = cv2.selectROI("Select drone ROI, then press ENTER", small_frame, False)
+    cv2.destroyWindow("Select drone ROI, then press ENTER")
+
+    x, y, w, h = small_bbox
+    if w <= 0 or h <= 0:
+        raise RuntimeError("No ROI selected.")
+
+    bbox = (int(x / scale), int(y / scale), int(w / scale), int(h / scale))
+    return frame, bbox
+
+
+# =========================
+# MAIN
+# =========================
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Markerless OpenCV tracker with motion sync and meter output.")
+    parser.add_argument("--video", default=VIDEO_PATH, help="Input video path")
+    parser.add_argument("--tracker", default="csrt", help="Tracker type: csrt, kcf, mil, goturn")
+    parser.add_argument("--output", default=OUTPUT_CSV_PATH, help="Output CSV file")
+    parser.add_argument("--start", type=float, default=START_TIME_S, help="Start time in seconds")
+    parser.add_argument("--end", type=float, default=END_TIME_S, help="End time in seconds")
+    parser.add_argument("--show", action="store_true", help="Show tracking window")
+    parser.add_argument("--no-sync", action="store_true", help="Disable sync and use raw video time only")
+    parser.add_argument("--sync-time", type=float, default=SYNC_EVENT_VIDEO_TIME_S, help="Known sync/FIG8_START video time in seconds")
+    parser.add_argument("--delay", type=float, default=DELAY_AFTER_SYNC_EVENT_S, help="Delay from selected sync event to FIG8_START in seconds")
+    parser.add_argument("--save-prestart", action="store_true", help="Also save rows before FIG8_START")
+    parser.add_argument("--no-origin", action="store_true", help="Skip manual origin selection; origin is first tracked center")
+    parser.add_argument("--no-meter-scale", action="store_true", help="Skip meter conversion")
+    parser.add_argument("--scale-distance", type=float, default=SCALE_DISTANCE_M, help="Known distance between clicked scale points in meters")
+    parser.add_argument("--mpp-x", type=float, default=METERS_PER_PIXEL_X, help="Known meters per pixel in x")
+    parser.add_argument("--mpp-y", type=float, default=METERS_PER_PIXEL_Y, help="Known meters per pixel in y")
+    args = parser.parse_args()
+
+    cap = cv2.VideoCapture(args.video)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {args.video}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if fps <= 0:
+        raise RuntimeError("Could not read video FPS.")
+
+    duration_s = total_frames / fps
+    start_frame = max(0, int(round(args.start * fps)))
+    end_frame = min(total_frames - 1, int(round(args.end * fps)))
+
+    if end_frame <= start_frame:
+        raise ValueError("End time must be greater than start time.")
+
+    print("\n=== Video Info ===")
+    print(f"Video: {args.video}")
+    print(f"FPS: {fps:.3f}")
+    print(f"Total frames: {total_frames}")
+    print(f"Duration: {duration_s:.3f} s")
+    print(f"Analysis window: {args.start:.3f} to {args.end:.3f} s")
+
+    use_sync = USE_SYNC_EVENT and not args.no_sync
+    sync_event_video_time_s = args.sync_time
+
+    if use_sync:
+        if sync_event_video_time_s is None:
+            sync_event_video_time_s = manual_select_sync_frame(cap, fps, start_frame=start_frame)
+        fig8_start_video_time_s = sync_event_video_time_s + args.delay
+        print("\n=== Sync Info ===")
+        print(f"Sync event video time: {sync_event_video_time_s:.3f} s")
+        print(f"Delay after sync event: {args.delay:.3f} s")
+        print(f"Figure-8 start video time: {fig8_start_video_time_s:.3f} s")
+    else:
+        sync_event_video_time_s = ""
+        fig8_start_video_time_s = 0.0
+        print("\nSync disabled. t_fig8_s = video_time_s.")
+
+    roi_frame_idx = max(start_frame, int(round(float(fig8_start_video_time_s) * fps))) if use_sync else start_frame
+    roi_frame_idx = min(roi_frame_idx, end_frame)
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, roi_frame_idx)
+    ret, sync_frame = cap.read()
+    if not ret:
+        raise RuntimeError("Could not read sync/ROI frame.")
+
+    origin_x_px: Optional[float] = None
+    origin_y_px: Optional[float] = None
+    if SELECT_ORIGIN_ON_SYNC_FRAME and not args.no_origin:
+        origin_x_px, origin_y_px = select_point(sync_frame, "Select Origin", "Click markerless origin on FIG8_START frame")
+        print(f"Selected origin: ({origin_x_px:.2f}, {origin_y_px:.2f}) px")
+
+    meters_per_pixel_x: Optional[float] = None
+    meters_per_pixel_y: Optional[float] = None
+    if USE_METER_SCALE and not args.no_meter_scale:
+        if args.mpp_x is not None and args.mpp_y is not None:
+            meters_per_pixel_x = float(args.mpp_x)
+            meters_per_pixel_y = float(args.mpp_y)
+            print(f"Using provided scale: mpp_x={meters_per_pixel_x:.8f}, mpp_y={meters_per_pixel_y:.8f}")
+        else:
+            print("\nSelect two scale points on the board/grid with a known physical distance.")
+            meters_per_pixel_x, meters_per_pixel_y = select_scale_points(sync_frame, args.scale_distance, USE_ISOTROPIC_SCALE)
+            print(f"Computed scale: mpp_x={meters_per_pixel_x:.8f}, mpp_y={meters_per_pixel_y:.8f}")
+
+    frame, bbox = select_initial_roi(cap, roi_frame_idx)
+    tracker = create_tracker(args.tracker)
+    tracker.init(frame, bbox)
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, roi_frame_idx)
+    frame_num = roi_frame_idx
+
+    output_path = Path(args.output)
+    total_to_process = end_frame - frame_num + 1
+    print(f"\nProcessing frames {frame_num} to {end_frame}")
+    print(f"Total frames: {total_to_process}")
+    print("Tracking started...\n")
+
+    origin_initialized_from_first_detection = False
+
+    with open(output_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "frame",
+            "video_time_s",
+            "t_fig8_s",
+            "detected",
+            "x_px",
+            "y_px",
+            "x_rel_px",
+            "y_rel_px",
+            "x_m",
+            "y_m",
+            "w_px",
+            "h_px",
+            "method",
+            "sync_event_video_time_s",
+            "fig8_start_video_time_s",
+            "origin_x_px",
+            "origin_y_px",
+            "meters_per_pixel_x",
+            "meters_per_pixel_y",
+            "scale_distance_m",
+        ])
+
+        while frame_num <= end_frame:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            detected, bbox = tracker.update(frame)
+            video_time_s = frame_num / fps
+            t_fig8_s = video_time_s - float(fig8_start_video_time_s)
+
+            if t_fig8_s < 0 and SAVE_ONLY_AFTER_FIG8_START and not args.save_prestart:
+                frame_num += 1
+                continue
+
+            processed = frame_num - roi_frame_idx
+            if processed > 0 and processed % 10 == 0:
+                elapsed = time.time() - start_clock
+                fps_processing = processed / elapsed if elapsed > 0 else 0.0
+                remaining_frames = max(0, end_frame - frame_num)
+                eta = remaining_frames / fps_processing if fps_processing > 0 else 0.0
+                percent = 100 * processed / max(1, total_to_process)
+                print(f"\r{percent:5.1f}% | {fps_processing:.1f} fps | ETA: {eta:.1f}s", end="", flush=True)
+
+            if detected:
+                x, y, w, h = [int(v) for v in bbox]
+                cx = x + w / 2.0
+                cy = y + h / 2.0
+
+                if origin_x_px is None or origin_y_px is None:
+                    origin_x_px = cx
+                    origin_y_px = cy
+                    origin_initialized_from_first_detection = True
+
+                x_rel_px = cx - origin_x_px
+                y_rel_px = cy - origin_y_px
+
+                if meters_per_pixel_x is not None and meters_per_pixel_y is not None:
+                    x_m = x_rel_px * meters_per_pixel_x
+                    y_m = y_rel_px * meters_per_pixel_y
+                else:
+                    x_m = ""
+                    y_m = ""
+
+                writer.writerow([
+                    frame_num,
+                    video_time_s,
+                    t_fig8_s,
+                    1,
+                    cx,
+                    cy,
+                    x_rel_px,
+                    y_rel_px,
+                    x_m,
+                    y_m,
+                    w,
+                    h,
+                    args.tracker,
+                    sync_event_video_time_s,
+                    fig8_start_video_time_s,
+                    origin_x_px,
+                    origin_y_px,
+                    meters_per_pixel_x if meters_per_pixel_x is not None else "",
+                    meters_per_pixel_y if meters_per_pixel_y is not None else "",
+                    args.scale_distance if meters_per_pixel_x is not None else "",
+                ])
+
+                if args.show:
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    cv2.circle(frame, (int(cx), int(cy)), 4, (0, 0, 255), -1)
+                    if origin_x_px is not None and origin_y_px is not None:
+                        cv2.circle(frame, (int(origin_x_px), int(origin_y_px)), 5, (255, 0, 0), -1)
+                    cv2.putText(frame, f"{args.tracker.upper()} TRACKED", (20, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            else:
+                writer.writerow([
+                    frame_num,
+                    video_time_s,
+                    t_fig8_s,
+                    0,
+                    "", "", "", "", "", "", "", "",
+                    args.tracker,
+                    sync_event_video_time_s,
+                    fig8_start_video_time_s,
+                    origin_x_px if origin_x_px is not None else "",
+                    origin_y_px if origin_y_px is not None else "",
+                    meters_per_pixel_x if meters_per_pixel_x is not None else "",
+                    meters_per_pixel_y if meters_per_pixel_y is not None else "",
+                    args.scale_distance if meters_per_pixel_x is not None else "",
+                ])
+
+                if args.show:
+                    cv2.putText(frame, "LOST", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+            if args.show:
+                cv2.putText(frame, f"video_t={video_time_s:.3f}s  fig8_t={t_fig8_s:.3f}s", (20, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                display_frame, _ = resize_for_display(frame)
+                cv2.imshow("Markerless Tracking", display_frame)
+                if cv2.waitKey(1) & 0xFF in [27, ord("q")]:
+                    break
+
+            frame_num += 1
+
+    cap.release()
+    cv2.destroyAllWindows()
+    print(f"\nDone. Saved markerless tracking data to: {output_path}")
+    if origin_initialized_from_first_detection:
+        print("Origin was set automatically from the first detected ROI center.")
+
+
+if __name__ == "__main__":
+    main()
